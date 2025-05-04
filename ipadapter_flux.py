@@ -47,23 +47,25 @@ class InstantXFluxIPAdapterModel:
         self.image_encoder = SiglipVisionModel.from_pretrained(self.image_encoder_path).to(self.device, dtype=torch.float16)
         self.clip_image_processor = AutoProcessor.from_pretrained(self.image_encoder_path)
         # state_dict
-        self.state_dict = torch.load(os.path.join(MODELS_DIR,self.ip_ckpt), map_location="cpu")
+        state_dict = torch.load(os.path.join(MODELS_DIR,self.ip_ckpt), map_location="cpu")
         self.joint_attention_dim = 4096
         self.hidden_size = 3072
-
-    def init_proj(self):
+        # init projection model
         self.image_proj_model = MLPProjModel(
             cross_attention_dim=self.joint_attention_dim, # 4096
             id_embeddings_dim=1152, 
             num_tokens=self.num_tokens,
         ).to(self.device, dtype=torch.float16)
+        self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+        # init ipadapter model
+        self.ip_attn_procs = self.init_ip_adapter()
+        ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
+        ip_layers.load_state_dict(state_dict["ip_adapter"], strict=True)
+        del state_dict
 
-    def set_ip_adapter(self, flux_model, weight, timestep_percent_range=(0.0, 1.0)):
-        s = flux_model.model_sampling
-        percent_to_timestep_function = lambda a: s.percent_to_sigma(a)
-        timestep_range = (percent_to_timestep_function(timestep_percent_range[0]), percent_to_timestep_function(timestep_percent_range[1]))
+    def init_ip_adapter(self, weight=1.0, timestep_percent_range=(0.0, 1.0)):
         ip_attn_procs = {} # 19+38=57
-        dsb_count = len(flux_model.diffusion_model.double_blocks)
+        dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
         for i in range(dsb_count):
             name = f"double_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
@@ -71,9 +73,9 @@ class InstantXFluxIPAdapterModel:
                     cross_attention_dim=self.joint_attention_dim,
                     num_tokens=self.num_tokens,
                     scale = weight,
-                    timestep_range = timestep_range
+                    timestep_range = timestep_percent_range
                 ).to(self.device, dtype=torch.float16)
-        ssb_count = len(flux_model.diffusion_model.single_blocks)
+        ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
         for i in range(ssb_count):
             name = f"single_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
@@ -81,29 +83,17 @@ class InstantXFluxIPAdapterModel:
                     cross_attention_dim=self.joint_attention_dim,
                     num_tokens=self.num_tokens,
                     scale = weight,
-                    timestep_range = timestep_range
+                    timestep_range = timestep_percent_range
                 ).to(self.device, dtype=torch.float16)
         return ip_attn_procs
     
-    def load_ip_adapter(self, flux_model, weight, timestep_percent_range=(0.0, 1.0)):
-        self.image_proj_model.load_state_dict(self.state_dict["image_proj"], strict=True)
-        ip_attn_procs = self.set_ip_adapter(flux_model, weight, timestep_percent_range)
-        ip_layers = torch.nn.ModuleList(ip_attn_procs.values())
-        ip_layers.load_state_dict(self.state_dict["ip_adapter"], strict=True)
-        return ip_attn_procs
-
-    @torch.inference_mode()
-    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if pil_image is not None:
-            if isinstance(pil_image, Image.Image):
-                pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.image_encoder.dtype)).pooler_output
-            clip_image_embeds = clip_image_embeds.to(dtype=torch.float16)
-        else:
-            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
-        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        return image_prompt_embeds
+    def update_ip_adapter(self, flux_model, weight, timestep_percent_range=(0.0, 1.0)):
+        s = flux_model.model_sampling
+        percent_to_timestep_function = lambda a: s.percent_to_sigma(a)
+        timestep_range = (percent_to_timestep_function(timestep_percent_range[0]), percent_to_timestep_function(timestep_percent_range[1]))
+        for ip_layer in self.ip_attn_procs.values():
+            ip_layer.scale = weight
+            ip_layer.timestep_range = timestep_range
 
 class IPAdapterFluxLoader:
     @classmethod
@@ -147,8 +137,7 @@ class ApplyIPAdapterFlux:
         pil_image = image.numpy()[0] * 255.0
         pil_image = Image.fromarray(pil_image.astype(np.uint8))
         # initialize ipadapter
-        ipadapter_flux.init_proj()
-        ip_attn_procs = ipadapter_flux.load_ip_adapter(model.model, weight, (start_percent, end_percent))
+        ipadapter_flux.update_ip_adapter(model.model, weight, (start_percent, end_percent))
         # process control image 
         image_prompt_embeds = ipadapter_flux.get_image_embeds(
             pil_image=pil_image, clip_image_embeds=None
@@ -156,7 +145,7 @@ class ApplyIPAdapterFlux:
         # set model
         is_patched = is_model_patched(model.model)
         bi = model.clone()
-        FluxUpdateModules(bi, ip_attn_procs, image_prompt_embeds, is_patched)
+        FluxUpdateModules(bi, ipadapter_flux.ip_attn_procs, image_prompt_embeds, is_patched)
         return (bi,)
 
 NODE_CLASS_MAPPINGS = {

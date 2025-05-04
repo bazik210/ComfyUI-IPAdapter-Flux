@@ -47,24 +47,26 @@ class InstantXFluxIPAdapterModelAdvanced:
         self.image_encoder = SiglipVisionModel.from_pretrained(self.image_encoder_path).to(self.device, dtype=torch.float16)
         self.clip_image_processor = AutoProcessor.from_pretrained(self.image_encoder_path)
         # state_dict
-        self.state_dict = torch.load(os.path.join(MODELS_DIR,self.ip_ckpt), map_location="cpu")
+        state_dict = torch.load(os.path.join(MODELS_DIR,self.ip_ckpt), map_location="cpu")
         self.joint_attention_dim = 4096
         self.hidden_size = 3072
-
-    def init_proj(self):
+        # init projection model
         self.image_proj_model = MLPProjModelAdvanced(
             cross_attention_dim=self.joint_attention_dim, # 4096
             id_embeddings_dim=1152, 
             num_tokens=self.num_tokens,
         ).to(self.device, dtype=torch.float16)
+        self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+        # init ipadapter model
+        self.ip_attn_procs = self.init_ip_adapter()
+        ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
+        ip_layers.load_state_dict(state_dict["ip_adapter"], strict=True)
+        del state_dict
 
-    def set_ip_adapter_advanced(self, flux_model, weight_params, timestep_percent_range=(0.0, 1.0)):
+    def init_ip_adapter_advanced(self, weight_params=(1.0, 1.0, 10), timestep_percent_range=(0.0, 1.0)):
         weight_start, weight_end, steps = weight_params
-        s = flux_model.model_sampling
-        percent_to_timestep_function = lambda a: s.percent_to_sigma(a)
-        timestep_range = (percent_to_timestep_function(timestep_percent_range[0]), percent_to_timestep_function(timestep_percent_range[1]))
         ip_attn_procs = {}
-        dsb_count = len(flux_model.diffusion_model.double_blocks)
+        dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
         for i in range(dsb_count):
             name = f"double_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
@@ -74,9 +76,9 @@ class InstantXFluxIPAdapterModelAdvanced:
                     scale_start=weight_start,
                     scale_end=weight_end,
                     total_steps=steps,
-                    timestep_range=timestep_range
+                    timestep_range=timestep_percent_range
                 ).to(self.device, dtype=torch.float16)
-        ssb_count = len(flux_model.diffusion_model.single_blocks)
+        ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
         for i in range(ssb_count):
             name = f"single_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
@@ -86,16 +88,20 @@ class InstantXFluxIPAdapterModelAdvanced:
                     scale_start=weight_start,
                     scale_end=weight_end,
                     total_steps=steps,
-                    timestep_range=timestep_range
+                    timestep_range=timestep_percent_range
                 ).to(self.device, dtype=torch.float16)
         return ip_attn_procs
-    
-    def load_ip_adapter_advanced(self, flux_model, weight, timestep_percent_range=(0.0, 1.0)):
-        self.image_proj_model.load_state_dict(self.state_dict["image_proj"], strict=True)
-        ip_attn_procs = self.set_ip_adapter_advanced(flux_model, weight, timestep_percent_range)
-        ip_layers = torch.nn.ModuleList(ip_attn_procs.values())
-        ip_layers.load_state_dict(self.state_dict["ip_adapter"], strict=True)
-        return ip_attn_procs
+
+    def update_ip_adapter_advanced(self, flux_model, weight_params, timestep_percent_range=(0.0, 1.0)):
+        weight_start, weight_end, steps = weight_params
+        s = flux_model.model_sampling
+        percent_to_timestep_function = lambda a: s.percent_to_sigma(a)
+        timestep_range = (percent_to_timestep_function(timestep_percent_range[0]), percent_to_timestep_function(timestep_percent_range[1]))
+        for ip_layer in self.ip_attn_procs.values():
+            ip_layer.scale_start = weight_start
+            ip_layer.scale_end = weight_end
+            ip_layer.total_steps = steps
+            ip_layer.timestep_range = timestep_range
 
     @torch.inference_mode()
     def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
@@ -158,21 +164,20 @@ class ApplyIPAdapterFluxAdvanced:
 
         pil_image = image.numpy()[0] * 255.0
         pil_image = Image.fromarray(pil_image.astype(np.uint8))
-        ipadapter_flux.init_proj()
         
         IPAFluxAttnProcessor2_0Advanced.reset_all_instances()
         
-        ip_attn_procs = ipadapter_flux.load_ip_adapter_advanced(model.model, (weight_start, weight_end, steps), (start_percent, end_percent))
+        ipadapter_flux.update_ip_adapter_advanced(model.model, (weight_start, weight_end, steps), (start_percent, end_percent))
         
         image_prompt_embeds = ipadapter_flux.get_image_embeds(
             pil_image=pil_image, clip_image_embeds=None
         )
         is_patched = is_model_patched(model.model)
         bi = model.clone()
-        FluxUpdateModules(bi, ip_attn_procs, image_prompt_embeds, is_patched)
+        FluxUpdateModules(bi, ipadapter_flux.ip_attn_procs, image_prompt_embeds, is_patched)
         
         # Store reference to processors for cleanup
-        bi.model._ip_attn_procs = ip_attn_procs
+        bi.model._ip_attn_procs = ipadapter_flux.ip_attn_procs
         
         return (bi,)
 
