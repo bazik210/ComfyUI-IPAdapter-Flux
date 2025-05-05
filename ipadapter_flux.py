@@ -95,6 +95,19 @@ class InstantXFluxIPAdapterModel:
             ip_layer.scale = weight
             ip_layer.timestep_range = timestep_range
 
+    @torch.inference_mode()
+    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
+        if pil_image is not None:
+            if isinstance(pil_image, Image.Image):
+                pil_image = [pil_image]
+            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.image_encoder.dtype)).pooler_output
+            clip_image_embeds = clip_image_embeds.to(dtype=torch.bfloat16)
+        else:
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.bfloat16)
+        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+        return image_prompt_embeds
+
 class IPAdapterFluxLoader:
     @classmethod
     def INPUT_TYPES(s):
