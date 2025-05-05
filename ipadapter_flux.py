@@ -102,9 +102,9 @@ class InstantXFluxIPAdapterModel:
                 pil_image = [pil_image]
             clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
             clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.image_encoder.dtype)).pooler_output
-            clip_image_embeds = clip_image_embeds.to(dtype=torch.bfloat16)
+            clip_image_embeds = clip_image_embeds.to(dtype=torch.float16)
         else:
-            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.bfloat16)
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
         return image_prompt_embeds
 
