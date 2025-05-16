@@ -29,7 +29,7 @@
 1. 前往 `ComfyUI/custom_nodes`  
 2. 克隆此仓库，路径应为 `ComfyUI/custom_nodes/comfyui-ipadapter-flux/*`，其中 `*` 表示仓库中的所有文件。  
 3. 进入 `ComfyUI/custom_nodes/comfyui-ipadapter-flux/` 并运行 `pip install -r requirements.txt`。  
-4. 下载 [ipadapter 权重](https://huggingface.co/InstantX/FLUX.1-dev-IP-Adapter) 到 `ComfyUI/models/ipadapter-flux`。  
+4. 下载 [ipadapter 权重](https://huggingface.co/InstantX/FLUX.1-dev-IP-Adapter) 到 `ComfyUI/models/ipadapter-flux`。 你也可以去下载 [google/siglip-so400m-patch14-384](https://huggingface.co/google/siglip-so400m-patch14-384) 到 `ComfyUI/models/clip_vision` 或者使用Huggingface的缓存加载siglip模型. 
 5. 安装完成后运行 ComfyUI！  
 
 ### 运行工作流

@@ -9,6 +9,7 @@ from .attention_processor import IPAFluxAttnProcessor2_0
 from .utils import is_model_patched, FluxUpdateModules
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter-flux")
+CLIP_VISION_DIR = os.path.join(folder_paths.models_dir, "clip_vision")
 if "ipadapter-flux" not in folder_paths.folder_names_and_paths:
     current_paths = [MODELS_DIR]
 else:
@@ -44,8 +45,15 @@ class InstantXFluxIPAdapterModel:
         self.ip_ckpt = ip_ckpt
         self.num_tokens = num_tokens
         # load image encoder
-        self.image_encoder = SiglipVisionModel.from_pretrained(self.image_encoder_path).to(self.device, dtype=torch.float16)
-        self.clip_image_processor = AutoProcessor.from_pretrained(self.image_encoder_path)
+        try:
+            self.image_encoder = SiglipVisionModel.from_pretrained(CLIP_VISION_DIR+"/"+self.image_encoder_path.split("/")[-1]).to(self.device, dtype=torch.float16)
+            self.clip_image_processor = AutoProcessor.from_pretrained(CLIP_VISION_DIR+"/"+self.image_encoder_path.split("/")[-1])
+        except:
+            try:
+                self.image_encoder = SiglipVisionModel.from_pretrained(self.image_encoder_path).to(self.device, dtype=torch.float16)
+                self.clip_image_processor = AutoProcessor.from_pretrained(self.image_encoder_path)
+            except:
+                raise Exception(f"Failed to load clip image processor for {self.image_encoder_path}, please check the huggingface cache directory or clip_vision directory")
         # state_dict
         state_dict = torch.load(os.path.join(MODELS_DIR,self.ip_ckpt), map_location="cpu")
         self.joint_attention_dim = 4096
