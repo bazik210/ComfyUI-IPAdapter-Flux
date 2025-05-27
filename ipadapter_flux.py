@@ -2,6 +2,7 @@ import torch
 import os
 import logging
 import folder_paths
+import json
 from transformers import AutoProcessor, CLIPVisionModel, AutoModel
 from PIL import Image
 import numpy as np
@@ -101,10 +102,58 @@ class InstantXFluxIPAdapterModel:
                 logging.info(f"Loading CLIP Vision from local path: {clip_path}")
                 if clip_path.endswith(".safetensors"):
                     state_dict = load_file(clip_path, device="cpu")
-                    # Guessing model by filename
+                    # Patch for vision_model.embeddings.position_embedding.weight
+                    pos_embedding_key = "vision_model.embeddings.position_embedding.weight"
+                    if pos_embedding_key in state_dict and state_dict[pos_embedding_key].shape[0] == 729:
+                        logging.warning("Patching position_embedding from 729 to 730")
+                        padding = torch.zeros(1, state_dict[pos_embedding_key].shape[1], device="cpu")
+                        state_dict[pos_embedding_key] = torch.cat([state_dict[pos_embedding_key], padding], dim=0)
+                        logging.info(f"Patched {pos_embedding_key} to shape: {state_dict[pos_embedding_key].shape}")
+                    # Determine hf_model dynamically
                     model_name = os.path.basename(clip_path)
-                    hf_model = CLIP_MODEL_MAPPING.get(model_name, "openai/clip-vit-large-patch14")
-                    self.image_encoder = CLIPVisionModel.from_pretrained(hf_model, state_dict=None).to(self.device, dtype=self.dtype)
+                    hf_model = CLIP_MODEL_MAPPING.get(model_name)
+                    if not hf_model:
+                        # Check config.json in the same directory
+                        config_path = os.path.join(os.path.dirname(clip_path), "config.json")
+                        if os.path.exists(config_path):
+                            with open(config_path, "r") as f:
+                                config = json.load(f)
+                                # Try multiple keys for model identification
+                                hf_model = config.get("_name_or_path") or config.get("model_type") or config.get("architecture")
+                                if hf_model:
+                                    logging.info(f"Extracted hf_model from config.json: {hf_model}")
+                                else:
+                                    logging.warning(f"No valid model identifier in {config_path}. Checking local fallback model.")
+                                    # Check for local clip-vit-large-patch14.safetensors
+                                    fallback_model = "clip-vit-large-patch14.safetensors"
+                                    fallback_path = os.path.join(CLIP_VISION_DIR, fallback_model)
+                                    if os.path.exists(fallback_path) and fallback_model in CLIP_MODEL_MAPPING:
+                                        hf_model = CLIP_MODEL_MAPPING[fallback_model]
+                                        clip_path = fallback_path
+                                        logging.info(f"Using local model: {clip_path} with hf_model: {hf_model}")
+                                    else:
+                                        hf_model = "openai/clip-vit-large-patch14"
+                                        logging.info(f"Falling back to Hugging Face model: {hf_model}")
+                        else:
+                            # No config.json, check local fallback model
+                            logging.warning(f"No config.json for {model_name}. Checking local fallback model.")
+                            fallback_model = "clip-vit-large-patch14.safetensors"
+                            fallback_path = os.path.join(CLIP_VISION_DIR, fallback_model)
+                            if os.path.exists(fallback_path) and fallback_model in CLIP_MODEL_MAPPING:
+                                hf_model = CLIP_MODEL_MAPPING[fallback_model]
+                                clip_path = fallback_path
+                                logging.info(f"Using local model: {clip_path} with hf_model: {hf_model}")
+                            else:
+                                if "/" in image_encoder_path:
+                                    hf_model = image_encoder_path
+                                    logging.info(f"Using image_encoder_path as hf_model: {hf_model}")
+                                else:
+                                    hf_model = "openai/clip-vit-large-patch14"
+                                    logging.warning(f"No local fallback model found. Falling back to Hugging Face model: {hf_model}")
+
+                    self.image_encoder = CLIPVisionModel.from_pretrained(
+                        hf_model, state_dict=None, ignore_mismatched_sizes=True
+                    ).to(self.device, dtype=self.dtype)
                     self.image_encoder.load_state_dict(state_dict, strict=False)
                     self.clip_image_processor = AutoProcessor.from_pretrained(hf_model)
                 else:
@@ -134,22 +183,32 @@ class InstantXFluxIPAdapterModel:
         all_keys = list(state_dict.keys())
         logging.info(f"State dict keys (first 10): {all_keys[:10]}")
 
-        # Default num_tokens
+         # Default num_tokens
         self.num_tokens = 4
-        # Check for XLabs model explicitly
-        if 'flux' in ip_ckpt:
+        logging.info(f"Set default num_tokens={self.num_tokens}")
+        # Check for InstantX or XLabs model
+        if "ip_adapter" in state_dict:
+            # Check nested keys for InstantX
+            ip_adapter_dict = state_dict.get("ip_adapter", {})
+            for k in ip_adapter_dict.keys():
+                if k.endswith("to_k_ip.weight"):
+                    self.num_tokens = 128
+                    logging.info(f"Detected InstantX IP-Adapter via ip_adapter.{k}, setting num_tokens={self.num_tokens}")
+                    break
+            else:
+                logging.info("No InstantX to_k_ip.weight keys found, falling back to auto-detection")
+        elif 'flux-ip-adapter' in ip_ckpt.lower():
             self.num_tokens = 128
-            logging.info(f"Set num_tokens={self.num_tokens} for XLabs model {ip_ckpt}")
-        else:
-            # Auto-detect num_tokens from to_k_ip.weight
-            for k in all_keys:
-                if k.endswith("ip_adapter_double_stream_k_proj.weight") or k.endswith("to_k_ip.weight"):
-                    weight_shape = state_dict[k].shape
-                    if weight_shape[1] % self.joint_attention_dim == 0:
-                        detected_num_tokens = weight_shape[1] // self.joint_attention_dim
-                        self.num_tokens = detected_num_tokens
-                        logging.info(f"Detected num_tokens={self.num_tokens} from {k} shape={weight_shape}")
-                        break
+            logging.info(f"Detected XLabs model {ip_ckpt}, setting num_tokens={self.num_tokens}")
+        # Auto-detect num_tokens from image_proj weights
+        if self.num_tokens == 4:  # Only if InstantX/XLabs not detected
+            image_proj_dict = state_dict.get("image_proj", {})
+            if "proj.2.weight" in image_proj_dict:
+                weight_shape = image_proj_dict["proj.2.weight"].shape
+                if weight_shape[0] % self.joint_attention_dim == 0:
+                    detected_num_tokens = weight_shape[0] // self.joint_attention_dim
+                    self.num_tokens = detected_num_tokens
+                    logging.info(f"Detected num_tokens={self.num_tokens} from image_proj.proj.2.weight shape={weight_shape}")
         logging.info(f"Final num_tokens={self.num_tokens}")
 
         # Checking image_proj
@@ -298,7 +357,7 @@ class ApplyIPAdapterFlux:
                 "model": ("MODEL",),
                 "ipadapter_flux": ("IP_ADAPTER_FLUX_INSTANTX",),
                 "image": ("IMAGE",),
-                "weight": ("FLOAT", {"default": 0.5, "min": -1.0, "max": 5.0, "step": 0.05}),
+                "weight": ("FLOAT", {"default": 0.75, "min": -1.0, "max": 5.0, "step": 0.05}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001})
             },
