@@ -3,14 +3,14 @@ import os
 import logging
 import folder_paths
 import json
-from transformers import AutoProcessor, CLIPVisionModel, AutoModel
+from transformers import AutoProcessor, CLIPVisionModel, SiglipVisionModel
 from PIL import Image
 import numpy as np
 from .attention_processor import IPAFluxAttnProcessor2_0
 from .utils import is_model_patched, FluxUpdateModules
 from safetensors.torch import load_file
 
-# Папки для моделей
+# Define model directories
 MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter-flux")
 CLIP_VISION_DIR = os.path.join(folder_paths.models_dir, "clip_vision")
 if "ipadapter-flux" not in folder_paths.folder_names_and_paths:
@@ -29,7 +29,7 @@ CLIP_MODEL_MAPPING = {
     "CLIP-ViT-bigG-14-laion2B-39B-b160k.safetensors": "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 }
 
-# Scanning folder clip_vision
+# Scan clip_vision directory for models
 def get_clip_vision_models():
     clip_vision_models = []
     local_model_names = set()
@@ -76,9 +76,9 @@ class MLPProjModel(torch.nn.Module):
         self.cross_attention_dim = cross_attention_dim
         self.num_tokens = num_tokens
         self.proj = torch.nn.Sequential(
-            torch.nn.Linear(id_embeddings_dim, id_embeddings_dim*2),
+            torch.nn.Linear(id_embeddings_dim, id_embeddings_dim * 2),
             torch.nn.GELU(),
-            torch.nn.Linear(id_embeddings_dim*2, cross_attention_dim*num_tokens),
+            torch.nn.Linear(id_embeddings_dim * 2, cross_attention_dim * num_tokens),
         )
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
@@ -94,21 +94,15 @@ class InstantXFluxIPAdapterModel:
         self.dtype = dtype
         self.image_encoder_path = image_encoder_path
         self.ip_ckpt = ip_ckpt
+        self.fallback_proj = None
 
-        # Loading image encoder
+        # Load Vision model
         try:
             clip_path = os.path.join(CLIP_VISION_DIR, image_encoder_path.replace("/", os.sep))
             if os.path.exists(clip_path):
                 logging.info(f"Loading CLIP Vision from local path: {clip_path}")
                 if clip_path.endswith(".safetensors"):
                     state_dict = load_file(clip_path, device="cpu")
-                    # Patch for vision_model.embeddings.position_embedding.weight
-                    pos_embedding_key = "vision_model.embeddings.position_embedding.weight"
-                    if pos_embedding_key in state_dict and state_dict[pos_embedding_key].shape[0] == 729:
-                        logging.warning("Patching position_embedding from 729 to 730")
-                        padding = torch.zeros(1, state_dict[pos_embedding_key].shape[1], device="cpu")
-                        state_dict[pos_embedding_key] = torch.cat([state_dict[pos_embedding_key], padding], dim=0)
-                        logging.info(f"Patched {pos_embedding_key} to shape: {state_dict[pos_embedding_key].shape}")
                     # Determine hf_model dynamically
                     model_name = os.path.basename(clip_path)
                     hf_model = CLIP_MODEL_MAPPING.get(model_name)
@@ -151,20 +145,32 @@ class InstantXFluxIPAdapterModel:
                                     hf_model = "openai/clip-vit-large-patch14"
                                     logging.warning(f"No local fallback model found. Falling back to Hugging Face model: {hf_model}")
 
-                    self.image_encoder = CLIPVisionModel.from_pretrained(
-                        hf_model, state_dict=None, ignore_mismatched_sizes=True
-                    ).to(self.device, dtype=self.dtype)
+                    # Selecting model class
+                    if "siglip" in model_name.lower() or "siglip" in hf_model.lower():
+                        logging.info(f"Loading SiglipVisionModel for: {hf_model}")
+                        self.image_encoder = SiglipVisionModel.from_pretrained(
+                            hf_model, state_dict=None, ignore_mismatched_sizes=True
+                        ).to(self.device, dtype=self.dtype)
+                    else:
+                        logging.info(f"Loading CLIPVisionModel for: {hf_model}")
+                        self.image_encoder = CLIPVisionModel.from_pretrained(
+                            hf_model, state_dict=None, ignore_mismatched_sizes=True
+                        ).to(self.device, dtype=self.dtype)
+
                     self.image_encoder.load_state_dict(state_dict, strict=False)
                     self.clip_image_processor = AutoProcessor.from_pretrained(hf_model)
                 else:
-                    self.image_encoder = AutoModel.from_pretrained(clip_path).to(self.device, dtype=self.dtype)
+                    self.image_encoder = CLIPVisionModel.from_pretrained(clip_path).to(self.device, dtype=self.dtype)
                     self.clip_image_processor = AutoProcessor.from_pretrained(clip_path)
             else:
                 logging.info(f"Loading CLIP Vision from Hugging Face: {image_encoder_path}")
-                self.image_encoder = AutoModel.from_pretrained(image_encoder_path).to(self.device, dtype=self.dtype)
+                if "siglip" in image_encoder_path.lower():
+                    self.image_encoder = SiglipVisionModel.from_pretrained(image_encoder_path).to(self.device, dtype=self.dtype)
+                else:
+                    self.image_encoder = CLIPVisionModel.from_pretrained(image_encoder_path).to(self.device, dtype=self.dtype)
                 self.clip_image_processor = AutoProcessor.from_pretrained(image_encoder_path)
         except Exception as e:
-            logging.error(f"Failed to load clip image processor: {e}")
+            logging.error(f"Failed to load CLIP Vision: {e}")
             raise
 
         # Loading IP-Adapter
@@ -180,59 +186,110 @@ class InstantXFluxIPAdapterModel:
         self.joint_attention_dim = 4096
         self.hidden_size = 3072
 
+        # Log state_dict keys
         all_keys = list(state_dict.keys())
         logging.info(f"State dict keys (first 10): {all_keys[:10]}")
 
-         # Default num_tokens
+        # Determine num_tokens
         self.num_tokens = 4
         logging.info(f"Set default num_tokens={self.num_tokens}")
-        # Check for InstantX or XLabs model
-        if "ip_adapter" in state_dict:
-            # Check nested keys for InstantX
-            ip_adapter_dict = state_dict.get("ip_adapter", {})
-            for k in ip_adapter_dict.keys():
-                if k.endswith("to_k_ip.weight"):
-                    self.num_tokens = 128
-                    logging.info(f"Detected InstantX IP-Adapter via ip_adapter.{k}, setting num_tokens={self.num_tokens}")
-                    break
-            else:
-                logging.info("No InstantX to_k_ip.weight keys found, falling back to auto-detection")
-        elif 'flux-ip-adapter' in ip_ckpt.lower():
-            self.num_tokens = 128
-            logging.info(f"Detected XLabs model {ip_ckpt}, setting num_tokens={self.num_tokens}")
-        # Auto-detect num_tokens from image_proj weights
-        if self.num_tokens == 4:  # Only if InstantX/XLabs not detected
-            image_proj_dict = state_dict.get("image_proj", {})
-            if "proj.2.weight" in image_proj_dict:
-                weight_shape = image_proj_dict["proj.2.weight"].shape
-                if weight_shape[0] % self.joint_attention_dim == 0:
-                    detected_num_tokens = weight_shape[0] // self.joint_attention_dim
-                    self.num_tokens = detected_num_tokens
-                    logging.info(f"Detected num_tokens={self.num_tokens} from image_proj.proj.2.weight shape={weight_shape}")
-        logging.info(f"Final num_tokens={self.num_tokens}")
 
-        # Checking image_proj
-        image_proj_dict = None
-        has_image_proj = any(k.startswith("image_proj.") for k in all_keys) or "image_proj" in state_dict
-        if has_image_proj:
-            if "image_proj" in state_dict:
-                image_proj_dict = state_dict["image_proj"]
+        # Find image_proj keys
+        image_proj_dict = state_dict.get("image_proj", {})
+        if not image_proj_dict:
+            # Try ip_adapter for proj keys (XLabs/InstantX)
+            image_proj_dict = {k.replace("ip_adapter.", ""): v for k, v in state_dict.items() if k.startswith("ip_adapter.") and "proj" in k.lower()}
+            if image_proj_dict:
+                logging.info(f"Found ip_adapter proj keys: {list(image_proj_dict.keys())[:5]}")
             else:
-                image_proj_dict = {k.replace("image_proj.", ""): v for k in all_keys if k.startswith("image_proj.")}
-            logging.info(f"Found image_proj keys: {list(image_proj_dict.keys())[:5]}")
-            self.image_proj_model = MLPProjModel(
-                cross_attention_dim=self.joint_attention_dim,
-                id_embeddings_dim=1152,
-                num_tokens=self.num_tokens,
-            ).to(self.device, dtype=self.dtype)
-            try:
-                self.image_proj_model.load_state_dict(image_proj_dict, strict=True)
-            except Exception as e:
-                logging.error(f"Failed to load image_proj: {e}")
-                raise
+                logging.warning("No image_proj, InstantX, or proj keys found")
+
+        # Auto-detect num_tokens
+        is_flux = False
+        if "norm.weight" in image_proj_dict and ("proj.weight" in image_proj_dict or "proj.2.weight" in image_proj_dict):
+            norm_size = image_proj_dict["norm.weight"].shape[0]
+            if "proj.weight" in image_proj_dict:  # Single-layer projector
+                weight_shape = image_proj_dict["proj.weight"].shape
+                if weight_shape[0] % norm_size == 0:
+                    self.num_tokens = weight_shape[0] // norm_size
+                    logging.info(f"Detected num_tokens={self.num_tokens} from proj.weight shape={weight_shape}, norm_size={norm_size}")
+            elif "proj.2.weight" in image_proj_dict:  # Multi-layer projector
+                weight_shape = image_proj_dict["proj.2.weight"].shape
+                if weight_shape[0] % norm_size == 0:
+                    self.num_tokens = weight_shape[0] // norm_size
+                    logging.info(f"Detected num_tokens={self.num_tokens} from proj.2.weight shape={weight_shape}, norm_size={norm_size}")
         else:
-            logging.warning("No image_proj keys found. Using raw clip_image_embeds.")
-            self.image_proj_model = None
+            # Fallback based on state_dict or file name
+            if any(k.startswith("double_blocks") for k in state_dict):
+                self.num_tokens = 128
+                is_flux = "flux" in self.ip_ckpt.lower()
+                logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
+            elif "sdxl" in self.ip_ckpt.lower():
+                self.num_tokens = 16
+                logging.info(f"Fallback to SDXL: num_tokens={self.num_tokens}")
+            elif "sd15" in self.ip_ckpt.lower():
+                self.num_tokens = 4
+                logging.info(f"Fallback to SD 1.5: num_tokens={self.num_tokens}")
+            else:
+                logging.warning("Using default num_tokens=4 due to missing proj keys")
+
+        logging.info(f"Final num_tokens={self.num_tokens}")
+		
+        # Handle XLabs projector
+        if is_flux:
+            xlabs_proj_dict = {}
+            for k in all_keys:
+                if "proj" in k.lower() and any(p in k.lower() for p in ["weight", "bias"]):
+                    if "double_blocks" in k:
+                        new_key = k.replace("double_blocks.0.processor.ip_adapter_double_stream_", "")
+                        xlabs_proj_dict[new_key] = state_dict[k]
+                    else:
+                        xlabs_proj_dict[k] = state_dict[k]
+            if xlabs_proj_dict:
+                logging.info(f"Found XLabs proj keys: {list(xlabs_proj_dict.keys())[:5]}")
+                self.image_proj_model = MLPProjModel(
+                    cross_attention_dim=self.joint_attention_dim,  # 4096
+                    id_embeddings_dim=self.image_encoder.config.hidden_size,  # 1024 for clip-vit-large-patch14
+                    num_tokens=self.num_tokens,  # 128
+                ).to(self.device, dtype=self.dtype)
+                try:
+                    proj = {}
+                    for key, value in state_dict.items():
+                        if key.startswith("ip_adapter_proj_model"):
+                            proj[key[len("ip_adapter_proj_model."):]] = value
+                    if not proj:
+                        logging.error("No ip_adapter_proj_model keys found in state_dict")
+                        raise KeyError("No ip_adapter_proj_model keys found")
+                    self.image_proj_model.load_state_dict(proj, strict=False)
+                    logging.info("Loaded XLabs image_proj successfully")
+                except Exception as e:
+                    logging.error(f"Failed to load XLabs parameters: {e}")
+                    raise
+
+        else:
+            # Checking image_proj
+            image_proj_dict = None
+            has_image_proj = any(k.startswith("image_proj.") for k in all_keys) or "image_proj" in state_dict
+            if has_image_proj:
+                if "image_proj" in state_dict:
+                    image_proj_dict = state_dict["image_proj"]
+                else:
+                    image_proj_dict = {k.replace("image_proj.", ""): v for k in all_keys if k.startswith("image_proj.")}
+                logging.info(f"Found image_proj keys: {list(image_proj_dict.keys())[:5]}")
+                self.image_proj_model = MLPProjModel(
+                    cross_attention_dim=self.joint_attention_dim,
+                    id_embeddings_dim=self.image_encoder.config.hidden_size, #1152
+                    num_tokens=self.num_tokens,
+                ).to(self.device, dtype=self.dtype)
+                try:
+                    self.image_proj_model.load_state_dict(image_proj_dict, strict=False)
+                    logging.info("Loaded image_proj successfully")
+                except Exception as e:
+                    logging.error(f"Failed to load image_proj: {e}")
+                    raise
+            else:
+                logging.warning("No image_proj keys found. Using raw clip_image_embeds.")
+                self.image_proj_model = None
 
         # Parsing ip_adapter
         ip_adapter_dict = {}
@@ -257,6 +314,7 @@ class InstantXFluxIPAdapterModel:
         logging.info(f"Loading ip_adapter with keys: {list(ip_adapter_dict.keys())[:5]}")
         try:
             ip_layers.load_state_dict(ip_adapter_dict, strict=False)
+            logging.info("Loaded ip_adapter successfully")
         except Exception as e:
             logging.error(f"Failed to load ip_adapter: {e}")
             raise
@@ -265,7 +323,7 @@ class InstantXFluxIPAdapterModel:
 
     def init_ip_adapter(self, weight=1.0, timestep_percent_range=(0.0, 1.0)):
         ip_attn_procs = {}
-        dsb_count = 19
+        dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
         for i in range(dsb_count):
             name = f"double_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
@@ -275,7 +333,7 @@ class InstantXFluxIPAdapterModel:
                 scale=weight,
                 timestep_range=timestep_percent_range
             ).to(self.device, dtype=self.dtype)
-        ssb_count = 38
+        ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
         for i in range(ssb_count):
             name = f"single_blocks.{i}"
             ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
@@ -297,6 +355,7 @@ class InstantXFluxIPAdapterModel:
 
     @torch.inference_mode()
     def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
+        # Generate image embeddings from PIL image or provided embeddings
         if pil_image is not None:
             if isinstance(pil_image, Image.Image):
                 pil_image = [pil_image]
@@ -310,11 +369,12 @@ class InstantXFluxIPAdapterModel:
             logging.info("Using raw clip_image_embeds")
             target_size = self.joint_attention_dim
             if clip_image_embeds.shape[1] != target_size:
-                logging.warning(f"Projecting clip_image_embeds from {clip_image_embeds.shape[1]} to joint_attention_dim={target_size}")
-                proj = torch.nn.Linear(clip_image_embeds.shape[1], target_size).to(self.device, dtype=self.dtype)
-                torch.nn.init.xavier_uniform_(proj.weight)
-                proj.bias.data.fill_(0)
-                clip_image_embeds = proj(clip_image_embeds)
+                if self.fallback_proj is None:
+                    logging.warning(f"Creating fallback projection from {clip_image_embeds.shape[1]} to joint_attention_dim={target_size}")
+                    self.fallback_proj = torch.nn.Linear(clip_image_embeds.shape[1], target_size).to(self.device, dtype=self.dtype)
+                    torch.nn.init.xavier_uniform_(self.fallback_proj.weight)
+                    self.fallback_proj.bias.data.fill_(0)
+                clip_image_embeds = self.fallback_proj(clip_image_embeds)
             clip_image_embeds = clip_image_embeds.unsqueeze(1).repeat(1, self.num_tokens, 1)
             return clip_image_embeds
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
@@ -338,9 +398,12 @@ class IPAdapterFluxLoader:
     CATEGORY = "InstantXNodes"
 
     def load_model(self, ipadapter, clip_vision, provider, dtype="auto"):
+        # Load IP-Adapter model
         logging.info(f"Loading InstantX IPAdapter Flux model with clip_vision={clip_vision}, dtype={dtype}")
         if dtype == "auto":
-            dtype = "bfloat16" if provider == "cuda" else "float16"
+            dtype = "float16"
+            if provider == "cuda" and torch.cuda.is_bf16_supported():
+                dtype = "bfloat16"
         model = InstantXFluxIPAdapterModel(
             image_encoder_path=clip_vision,
             ip_ckpt=ipadapter,
@@ -370,7 +433,11 @@ class ApplyIPAdapterFlux:
     def apply_ipadapter_flux(self, model, ipadapter_flux, image, weight, start_percent, end_percent):
         pil_image = Image.fromarray((image.numpy()[0] * 255.0).astype(np.uint8))
         ipadapter_flux.update_ip_adapter(model.model, weight, (start_percent, end_percent))
+
+		# Get image embeddings
         image_prompt_embeds = ipadapter_flux.get_image_embeds(pil_image=pil_image, clip_image_embeds=None)
+        
+        # Apply IP-Adapter to the model
         is_patched = is_model_patched(model.model)
         bi = model.clone()
         FluxUpdateModules(bi, ipadapter_flux.ip_attn_procs, image_prompt_embeds, is_patched)
