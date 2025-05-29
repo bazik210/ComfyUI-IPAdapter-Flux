@@ -14,6 +14,7 @@ class IPAFluxAttnProcessor2_0(nn.Module):
         self.hidden_size = hidden_size # 3072
         self.cross_attention_dim = cross_attention_dim # 4096
         self.scale = scale
+        self.weight = scale
         self.num_tokens = num_tokens
         
         self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
@@ -28,12 +29,15 @@ class IPAFluxAttnProcessor2_0(nn.Module):
         num_heads,
         query,
         image_emb: torch.FloatTensor,
-        t: torch.FloatTensor|torch.Tensor
+        t: torch.FloatTensor|torch.Tensor,
+        is_sd15: bool = False
     ) -> torch.FloatTensor|torch.Tensor|None:
         # only apply IPA if timestep is within range
-        if self.timestep_range is not None:
+        if self.timestep_range is not None and not is_sd15:
             if t[0] > self.timestep_range[0] or t[0] < self.timestep_range[1]:
+                logging.debug(f"Skipping IPA at timestep {t[0]} outside range {self.timestep_range}")
                 return None
+                
         # `ip-adapter` projections
         ip_hidden_states = image_emb
         ip_hidden_states_key_proj = self.to_k_ip(ip_hidden_states)
@@ -53,4 +57,10 @@ class IPAFluxAttnProcessor2_0(nn.Module):
         ip_hidden_states = rearrange(ip_hidden_states, "B H L D -> B L (H D)", H=num_heads)
         ip_hidden_states = ip_hidden_states.to(query.dtype).to(query.device)
         
-        return self.scale * ip_hidden_states
+        scaling_factor = self.weight if is_sd15 else self.scale
+        logging.info(f"IPAFluxAttnProcessor2_0: is_sd15={is_sd15}, scaling_factor={scaling_factor}, "
+                     f"ip_hidden_states shape={ip_hidden_states.shape}, "
+                     f"min={ip_hidden_states.min().item()}, max={ip_hidden_states.max().item()}")
+        
+        return ip_hidden_states * scaling_factor
+

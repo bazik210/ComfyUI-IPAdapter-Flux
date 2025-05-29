@@ -7,8 +7,13 @@ from transformers import AutoProcessor, CLIPVisionModel, SiglipVisionModel
 from PIL import Image
 import numpy as np
 from .attention_processor import IPAFluxAttnProcessor2_0
-from .utils import is_model_patched, FluxUpdateModules
+from .utils import is_model_patched, FluxUpdateModules, _compute_sha256
 from safetensors.torch import load_file
+
+KNOWN_XLAB_HASHES = {
+    "750f912149b84bbb0c2a6ce90ffa7e78afd1795821407718724ebcd36372dc2d",
+    "8f2bfddaffc4fe2a6667bef24c8ce6075e81d01d0f6b0f9adbe46ad686057ee2"
+}
 
 # Define model directories
 MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter-flux")
@@ -89,7 +94,7 @@ class MLPProjModel(torch.nn.Module):
         return x
 
 class InstantXFluxIPAdapterModel:
-    def __init__(self, image_encoder_path, ip_ckpt, device, dtype=torch.bfloat16):
+    def __init__(self, image_encoder_path, ip_ckpt, device, dtype=torch.bfloat16, shuffle_weights=False):
         self.device = device
         self.dtype = dtype
         self.image_encoder_path = image_encoder_path
@@ -138,7 +143,7 @@ class InstantXFluxIPAdapterModel:
                                 clip_path = fallback_path
                                 logging.info(f"Using local model: {clip_path} with hf_model: {hf_model}")
                             else:
-                                if "/" in image_encoder_path:
+                                if "/" in image_encoder_path and not os.path.exists(image_encoder_path):
                                     hf_model = image_encoder_path
                                     logging.info(f"Using image_encoder_path as hf_model: {hf_model}")
                                 else:
@@ -183,16 +188,66 @@ class InstantXFluxIPAdapterModel:
             state_dict = torch.load(path, map_location="cpu")
             logging.info("Loaded using torch.load")
 
-        self.joint_attention_dim = 4096
-        self.hidden_size = 3072
-
-        # Log state_dict keys
-        all_keys = list(state_dict.keys())
-        logging.info(f"State dict keys (first 10): {all_keys[:10]}")
+        sha256_hash = _compute_sha256(path)
+        is_xlab = sha256_hash in KNOWN_XLAB_HASHES
+        logging.info(f"SHA256: {sha256_hash}, is_xlab: {is_xlab}")
 
         # Determine num_tokens
         self.num_tokens = 4
         logging.info(f"Set default num_tokens={self.num_tokens}")
+
+        # Check adapter keys
+        ip_adapter_keys = state_dict.get('ip_adapter', {}).keys()
+        image_proj_keys = state_dict.get('image_proj', {}).keys()
+        logging.info(f"ip_adapter keys: {list(ip_adapter_keys)[:10]}, image_proj keys: {list(image_proj_keys)[:10]}")
+                
+        # Detect adapter type
+        is_instantx = any("to_k_ip" in k.lower() for k in ip_adapter_keys)
+        to_k_ip_shape = next((state_dict['ip_adapter'][k].shape[-1] for k in ip_adapter_keys if "to_k_ip" in k.lower()), 0) if is_instantx else 0
+
+        # Adapter configurations
+        ADAPTER_CONFIGS = {
+            'flux.1': {'num_tokens': 128, 'joint_attention_dim': 4096, 'hidden_size': 3072, 'blocks': [('double_blocks', 19), ('single_blocks', 38)]},
+            'sd3.5': {'num_tokens': 64, 'joint_attention_dim': 2560, 'hidden_size': 1536, 'blocks': [('block', 12)]},
+            'sdxl': {'num_tokens': 16, 'joint_attention_dim': 2048, 'hidden_size': 1280, 'blocks': [('block', 12)]},
+            'sd1.5': {'num_tokens': 4, 'joint_attention_dim': 768, 'hidden_size': None, 'blocks': [('block', 16)]},  # Dynamic hidden_size
+            'sd1.5_classic': {'num_tokens': 4, 'joint_attention_dim': 768, 'hidden_size': 640, 'blocks': [('block', 512)]},
+            'instantx': {'num_tokens': 128, 'joint_attention_dim': 4096, 'hidden_size': 3072, 'blocks': [('double_blocks', 19), ('single_blocks', 38)]}
+        }
+
+        # Detect adapter type
+        is_instantx = any("to_k_ip" in k.lower() for k in ip_adapter_keys)
+        to_k_ip_shape = next((state_dict['ip_adapter'][k].shape[1] for k in ip_adapter_keys if "to_k_ip" in k.lower()), 0) if is_instantx else 0
+
+        is_instantx_flux = False
+        if is_xlab or any(k.startswith(("double_blocks", "single_blocks")) for k in state_dict) or "flux" in self.ip_ckpt.lower():
+            self.config = ADAPTER_CONFIGS['flux.1']
+            logging.info("Detected Flux.1: num_tokens=128")
+        elif is_instantx and to_k_ip_shape == 2560:
+            self.config = ADAPTER_CONFIGS['sd3.5']
+            logging.info("Detected SD3.5: num_tokens=64")
+        elif is_instantx and to_k_ip_shape == 4096 and 'proj.2.weight' in image_proj_keys:
+            self.config = {**ADAPTER_CONFIGS['instantx'], 'type': 'instantx'}
+            logging.info("Detected InstantX: num_tokens=128")
+            is_instantx_flux = True
+        elif is_instantx and to_k_ip_shape == 768:
+            self.config = ADAPTER_CONFIGS['sd1.5']
+            logging.info("Detected SD1.5 (h94/IP-Adapter): num_tokens=4")
+        elif "sdxl" in self.ip_ckpt.lower() or any(k.startswith("unet.down_blocks") for k in state_dict):
+            self.config = ADAPTER_CONFIGS['sdxl']
+            logging.info("Detected SDXL: num_tokens=16")
+        else:
+            self.config = ADAPTER_CONFIGS['sd1.5_classic']
+            logging.info("Detected SD1.5 (classic): num_tokens=4")
+            
+        self.num_tokens = self.config['num_tokens']
+        self.joint_attention_dim = self.config['joint_attention_dim']
+        self.hidden_size = self.config.get('hidden_size')
+        self.blocks = self.config['blocks']
+
+        # Log state_dict keys
+        all_keys = list(state_dict.keys())
+        logging.info(f"State dict keys (first 10): {all_keys[:10]}")
 
         # Find image_proj keys
         image_proj_dict = state_dict.get("image_proj", {})
@@ -204,8 +259,7 @@ class InstantXFluxIPAdapterModel:
             else:
                 logging.warning("No image_proj, InstantX, or proj keys found")
 
-        # Auto-detect num_tokens
-        is_flux = False
+        # Auto-detect to make sure about the num_tokens   
         if "norm.weight" in image_proj_dict and ("proj.weight" in image_proj_dict or "proj.2.weight" in image_proj_dict):
             norm_size = image_proj_dict["norm.weight"].shape[0]
             if "proj.weight" in image_proj_dict:  # Single-layer projector
@@ -218,25 +272,11 @@ class InstantXFluxIPAdapterModel:
                 if weight_shape[0] % norm_size == 0:
                     self.num_tokens = weight_shape[0] // norm_size
                     logging.info(f"Detected num_tokens={self.num_tokens} from proj.2.weight shape={weight_shape}, norm_size={norm_size}")
-        else:
-            # Fallback based on state_dict or file name
-            if any(k.startswith("double_blocks") for k in state_dict):
-                self.num_tokens = 128
-                is_flux = "flux" in self.ip_ckpt.lower()
-                logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
-            elif "sdxl" in self.ip_ckpt.lower():
-                self.num_tokens = 16
-                logging.info(f"Fallback to SDXL: num_tokens={self.num_tokens}")
-            elif "sd15" in self.ip_ckpt.lower():
-                self.num_tokens = 4
-                logging.info(f"Fallback to SD 1.5: num_tokens={self.num_tokens}")
-            else:
-                logging.warning("Using default num_tokens=4 due to missing proj keys")
 
-        logging.info(f"Final num_tokens={self.num_tokens}")
+        logging.info(f"Final num_tokens after auto-detect check={self.num_tokens}")
 		
         # Handle XLabs projector
-        if is_flux:
+        if is_xlab:
             xlabs_proj_dict = {}
             for k in all_keys:
                 if "proj" in k.lower() and any(p in k.lower() for p in ["weight", "bias"]):
@@ -265,7 +305,6 @@ class InstantXFluxIPAdapterModel:
                 except Exception as e:
                     logging.error(f"Failed to load XLabs parameters: {e}")
                     raise
-
         else:
             # Checking image_proj
             image_proj_dict = None
@@ -309,48 +348,131 @@ class InstantXFluxIPAdapterModel:
             raise KeyError(f"No ip_adapter keys found in {path}")
 
         # Initialize ipadapter
-        self.ip_attn_procs = self.init_ip_adapter()
-        ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
+        self.ip_attn_procs = self.init_ip_adapter(state_dict)
+        # Create ModuleList for IP-Adapter processors
+        if shuffle_weights:
+            if is_instantx_flux:
+                # For InstantX Flux, use values directly without sorting
+                ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
+            else:
+                # Shuffle keys randomly for non-InstantX Flux adapters
+                import random
+                keys = list(self.ip_attn_procs.keys())
+                random.shuffle(keys)
+                ip_layers = torch.nn.ModuleList([self.ip_attn_procs[key] for key in keys])
+            logging.info("Using shuffled weights for IP-Adapter")
+        else:
+            # Check if we're dealing with SD1.5 (h94/IP-Adapter) or another adapter
+            if self.hidden_size is None:  # SD1.5 (h94/IP-Adapter)
+                # Sort keys numerically for SD1.5 (e.g., block_1, block_3, ..., block_31)
+                sorted_keys = sorted(self.ip_attn_procs.keys(), key=lambda x: int(x.split('_')[1]))
+            else:
+                # Use standard sorting for other adapters (Flux.1, InstantX, SD3.5, SDXL)
+                sorted_keys = sorted(self.ip_attn_procs.keys())
+            ip_layers = torch.nn.ModuleList([self.ip_attn_procs[key] for key in sorted_keys])
+            logging.info("Using sorted weights for IP-Adapter")
+            
+        ip_adapter_dict = state_dict.get('ip_adapter', state_dict)
         logging.info(f"Loading ip_adapter with keys: {list(ip_adapter_dict.keys())[:5]}")
-        try:
-            ip_layers.load_state_dict(ip_adapter_dict, strict=False)
-            logging.info("Loaded ip_adapter successfully")
-        except Exception as e:
-            logging.error(f"Failed to load ip_adapter: {e}")
-            raise
+        
+        # Adapt state_dict to match our block structure
+        new_state_dict = {}
+        for key in ip_adapter_dict:
+            if not (key.endswith("to_k_ip.weight") or key.endswith("to_v_ip.weight")):
+                # Skip keys that are not related to to_k_ip.weight or to_v_ip.weight
+                logging.debug(f"Skipping non-attention key: {key}")
+                continue
 
-        del state_dict
+            # Determine key format and extract block index
+            parts = key.split('.')
+            block_idx = None
+            block_name = None
 
-    def init_ip_adapter(self, weight=1.0, timestep_percent_range=(0.0, 1.0)):
+            if parts[0].isdigit():  # SD1.5 format: "1.to_k_ip.weight"
+                block_idx = int(parts[0])
+                block_name = f"block_{block_idx}"
+            elif parts[0] in ["double_blocks", "single_blocks"] and len(parts) > 1 and parts[1].isdigit():  # Flux.1/InstantX format
+                block_idx = int(parts[1])
+                block_name = f"{parts[0]}.{block_idx}"
+            elif parts[0] == "block" and len(parts) > 1 and parts[1].isdigit():  # SD3.5/SDXL format
+                block_idx = int(parts[1])
+                block_name = f"block_{block_idx}"
+            else:
+                # Unknown format, skip adaptation
+                logging.warning(f"Unknown key format for {key}. Skipping.")
+                continue
+
+            # Form new key for ModuleList
+            new_key = f"{block_idx}.to_k_ip.weight" if "to_k_ip" in key else f"{block_idx}.to_v_ip.weight"
+
+            # Check if block exists in ip_attn_procs
+            if block_name not in self.ip_attn_procs:
+                logging.warning(f"Block {block_name} not found in ip_attn_procs. Skipping {key}.")
+                continue
+
+            # Check if hidden_size matches
+            expected_hidden_size = self.ip_attn_procs[block_name].hidden_size
+            actual_hidden_size = ip_adapter_dict[key].shape[0]
+            if actual_hidden_size != expected_hidden_size:
+                logging.warning(f"Size mismatch for {key}: expected hidden_size={expected_hidden_size}, got {actual_hidden_size}. Skipping.")
+                continue
+
+            new_state_dict[new_key] = ip_adapter_dict[key]
+
+    def init_ip_adapter(self, state_dict, weight=1.0, timestep_percent_range=(0.0, 1.0)):
+        # Dictionary to store IP-Adapter attention processors
         ip_attn_procs = {}
-        dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
-        for i in range(dsb_count):
-            name = f"double_blocks.{i}"
-            ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
-                hidden_size=self.hidden_size,
-                cross_attention_dim=self.joint_attention_dim,
-                num_tokens=self.num_tokens,
-                scale=weight,
-                timestep_range=timestep_percent_range
-            ).to(self.device, dtype=self.dtype)
-        ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
-        for i in range(ssb_count):
-            name = f"single_blocks.{i}"
-            ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
-                hidden_size=self.hidden_size,
-                cross_attention_dim=self.joint_attention_dim,
-                num_tokens=self.num_tokens,
-                scale=weight,
-                timestep_range=timestep_percent_range
-            ).to(self.device, dtype=self.dtype)
+        
+        if self.hidden_size is None:  # SD1.5 (h94/IP-Adapter)
+            # Extract hidden_size dynamically from state_dict for each block
+            ip_adapter_dict = state_dict.get('ip_adapter', state_dict)
+            hidden_sizes = {}
+            for key in ip_adapter_dict:
+                if key.endswith("to_k_ip.weight"):
+                    block_idx = int(key.split('.')[0])
+                    hidden_size = ip_adapter_dict[key].shape[0]
+                    hidden_sizes[block_idx] = hidden_size
+                    logging.info(f"Detected block_{block_idx} with hidden_size={hidden_size}")
+            
+            # Create processors for each block with the detected hidden_size
+            for block_idx, hidden_size in hidden_sizes.items():
+                name = f"block_{block_idx}"
+                ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=self.joint_attention_dim,
+                    num_tokens=self.num_tokens,
+                    scale=weight,
+                    timestep_range=timestep_percent_range
+                ).to(self.device, dtype=self.dtype)
+                ip_attn_procs[name].weight = weight
+                logging.info(f"SD1.5: Created processor for {name} with hidden_size={hidden_size}, weight={weight}")
+        else:  # Flux.1, SD3.5, SDXL, InstantX
+            # Create processors for other adapters with fixed hidden_size
+            for block_prefix, block_count in self.blocks:
+                for i in range(block_count):
+                    name = f"{block_prefix}.{i}"
+                    ip_attn_procs[name] = IPAFluxAttnProcessor2_0(
+                        hidden_size=self.hidden_size,
+                        cross_attention_dim=self.joint_attention_dim,
+                        num_tokens=self.num_tokens,
+                        scale=weight,
+                        timestep_range=timestep_percent_range
+                    ).to(self.device, dtype=self.dtype)
+                    logging.info(f"Created processor for {name} with hidden_size={self.hidden_size}")
+        
         return ip_attn_procs
 
     def update_ip_adapter(self, flux_model, weight, timestep_percent_range=(0.0, 1.0)):
         s = flux_model.model_sampling
         percent_to_timestep_function = lambda a: s.percent_to_sigma(a)
         timestep_range = (percent_to_timestep_function(timestep_percent_range[0]), percent_to_timestep_function(timestep_percent_range[1]))
-        for ip_layer in self.ip_attn_procs.values():
-            ip_layer.scale = weight
+        for name, ip_layer in self.ip_attn_procs.items():
+            if self.hidden_size is None:  # SD1.5
+                ip_layer.weight = weight
+                logging.info(f"SD1.5: Updated IP-Adapter layer {name}: weight={ip_layer.weight}, timestep_range={timestep_range}")
+            else:  # Flux
+                ip_layer.scale = weight
+                logging.info(f"Flux: Updated IP-Adapter layer {name}: scale={ip_layer.scale}, timestep_range={timestep_range}")
             ip_layer.timestep_range = timestep_range
 
     @torch.inference_mode()
@@ -389,6 +511,7 @@ class IPAdapterFluxLoader:
                 "clip_vision": (get_clip_vision_models(),),
                 "provider": (["cuda", "cpu", "mps"],),
                 "dtype": (["auto", "float16", "bfloat16"], {"default": "auto"}),
+                "shuffle_weights": ("BOOLEAN", {"default": False})
             }
         }
 
@@ -397,7 +520,7 @@ class IPAdapterFluxLoader:
     FUNCTION = "load_model"
     CATEGORY = "InstantXNodes"
 
-    def load_model(self, ipadapter, clip_vision, provider, dtype="auto"):
+    def load_model(self, ipadapter, clip_vision, provider, dtype="auto", shuffle_weights="False"):
         # Load IP-Adapter model
         logging.info(f"Loading InstantX IPAdapter Flux model with clip_vision={clip_vision}, dtype={dtype}")
         if dtype == "auto":
@@ -408,7 +531,8 @@ class IPAdapterFluxLoader:
             image_encoder_path=clip_vision,
             ip_ckpt=ipadapter,
             device=provider,
-            dtype=getattr(torch, dtype)
+            dtype=getattr(torch, dtype),
+            shuffle_weights=shuffle_weights
         )
         return (model,)
 
@@ -431,17 +555,53 @@ class ApplyIPAdapterFlux:
     CATEGORY = "InstantXNodes"
 
     def apply_ipadapter_flux(self, model, ipadapter_flux, image, weight, start_percent, end_percent):
-        pil_image = Image.fromarray((image.numpy()[0] * 255.0).astype(np.uint8))
-        ipadapter_flux.update_ip_adapter(model.model, weight, (start_percent, end_percent))
+        """
+        Apply IP-Adapter to the model for Flux.1/InstantX or SD1.5 architectures.
 
-		# Get image embeddings
+        Args:
+            model: Diffusion model to patch.
+            ipadapter_flux: IP-Adapter instance.
+            image: Input image tensor.
+            weight: Adapter weight.
+            start_percent: Start timestep percentage (0 to 1).
+            end_percent: End timestep percentage (0 to 1).
+        Returns:
+            Tuple containing the patched model clone.
+        """
+        # Convert image to PIL format
+        pil_image = Image.fromarray((image.numpy()[0] * 255.0).astype(np.uint8))
+        logging.info(f"Converted image to PIL format with size: {pil_image.size}")
+
+        # Update IP-Adapter parameters
+        ipadapter_flux.update_ip_adapter(model.model, weight, (start_percent, end_percent))
+        logging.info(f"Updated IP-Adapter with weight={weight}, timestep range=({start_percent}, {end_percent})")
+
+        # Get image embeddings
         image_prompt_embeds = ipadapter_flux.get_image_embeds(pil_image=pil_image, clip_image_embeds=None)
-        
+        logging.info(f"Generated image embeddings with shape: {image_prompt_embeds.shape}")
+
         # Apply IP-Adapter to the model
         is_patched = is_model_patched(model.model)
+        logging.info(f"Model is already patched: {is_patched}")
         bi = model.clone()
-        FluxUpdateModules(bi, ipadapter_flux.ip_attn_procs, image_prompt_embeds, is_patched)
+        logging.info(f"Created model clone for patching. Type of bi: {type(bi)}")
+
+        # Compute sigma range for SD1.5
+        sigma_start, sigma_end = float("inf"), 0.0  # Default: apply always if percent_to_sigma unavailable
+        if hasattr(model.get_model_object("model_sampling"), "percent_to_sigma"):
+            try:
+                sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_percent)
+                sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_percent)
+                logging.info(f"Computed sigma range for SD1.5: [{sigma_end}, {sigma_start}]")
+            except Exception as e:
+                logging.warning(f"Failed to compute sigma range: {e}. Using full range.")
+        else:
+            logging.warning("model_sampling.percent_to_sigma not found. Applying IP-Adapter for full range.")
+
+        FluxUpdateModules(bi, ipadapter_flux.ip_attn_procs, image_prompt_embeds, is_patched, sigma_start=sigma_start, sigma_end=sigma_end)
+        logging.info("Applied IP-Adapter to the model clone")
         return (bi,)
+
 
 NODE_CLASS_MAPPINGS = {
     "IPAdapterFluxLoader": IPAdapterFluxLoader,

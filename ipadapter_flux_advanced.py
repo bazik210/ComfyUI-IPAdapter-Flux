@@ -7,7 +7,7 @@ from transformers import AutoProcessor, CLIPVisionModel, SiglipVisionModel
 from PIL import Image
 import numpy as np
 from .attention_processor_advanced import IPAFluxAttnProcessor2_0Advanced
-from .utils import is_model_patched, FluxUpdateModules
+from .utils import is_model_patched, FluxUpdateModules, _compute_sha256
 from safetensors.torch import load_file
 
 # Define model directories
@@ -183,16 +183,47 @@ class InstantXFluxIPAdapterModelAdvanced:
             state_dict = torch.load(path, map_location="cpu")
             logging.info("Loaded using torch.load")
 
-        self.joint_attention_dim = 4096
-        self.hidden_size = 3072
-
-        # Log state_dict keys
-        all_keys = list(state_dict.keys())
-        logging.info(f"State dict keys (first 10): {all_keys[:10]}")
+        sha256_hash = _compute_sha256(path)
+        is_xlab = sha256_hash in KNOWN_XLAB_HASHES
+        logging.info(f"SHA256: {sha256_hash}, is_xlab: {is_xlab}")
 
         # Determine num_tokens
         self.num_tokens = 4
         logging.info(f"Set default num_tokens={self.num_tokens}")
+        
+        # Check nested keys
+        ip_adapter_keys = state_dict.get('ip_adapter', {}).keys()
+        image_proj_keys = state_dict.get('image_proj', {}).keys()
+        logging.info(f"ip_adapter keys: {list(ip_adapter_keys)[:10]}, image_proj keys: {list(image_proj_keys)[:10]}")
+                
+        is_instantx = any("to_k_ip" in k.lower() for k in ip_adapter_keys) and any("proj.0" in k.lower() for k in image_proj_keys)
+        is_instantx_flux = False
+        if is_instantx and any(state_dict['ip_adapter'][k].shape[-1] == 4096 for k in ip_adapter_keys if "to_k_ip" in k.lower()):
+            is_instantx_flux = True
+
+        if is_xlab or any(k.startswith(("double_blocks", "single_blocks")) or "double_stream" in k.lower() for k in state_dict) or is_instantx_flux:
+            self.joint_attention_dim = 4096
+            self.hidden_size = 3072
+            self.num_tokens = 128
+            logging.info("Flux.1: num_tokens=128")
+        elif "sdxl" in self.ip_ckpt.lower() or any(k.startswith("unet.down_blocks") for k in state_dict):
+            self.joint_attention_dim = 2048
+            self.hidden_size = 1280
+            self.num_tokens = 16
+            logging.info("SDXL: num_tokens=16")
+        elif "sd15" in self.ip_ckpt.lower() or any(k.startswith("unet.") for k in state_dict):
+            self.joint_attention_dim = 768
+            self.hidden_size = 640
+            self.num_tokens = 4
+            logging.info("SD1.5: num_tokens=4")
+        else:
+            self.joint_attention_dim = 768
+            self.hidden_size = 640
+            logging.warning("Using default num_tokens=4 due to unknown structure")
+
+        # Log state_dict keys
+        all_keys = list(state_dict.keys())
+        logging.info(f"State dict keys (first 10): {all_keys[:10]}")
 
         # Find image_proj keys
         image_proj_dict = state_dict.get("image_proj", {})
@@ -204,8 +235,7 @@ class InstantXFluxIPAdapterModelAdvanced:
             else:
                 logging.warning("No image_proj, InstantX, or proj keys found")
 
-        # Auto-detect num_tokens
-        is_flux = False
+        # Auto-detect to make sure about the num_tokens
         if "norm.weight" in image_proj_dict and ("proj.weight" in image_proj_dict or "proj.2.weight" in image_proj_dict):
             norm_size = image_proj_dict["norm.weight"].shape[0]
             if "proj.weight" in image_proj_dict:  # Single-layer projector
@@ -218,25 +248,11 @@ class InstantXFluxIPAdapterModelAdvanced:
                 if weight_shape[0] % norm_size == 0:
                     self.num_tokens = weight_shape[0] // norm_size
                     logging.info(f"Detected num_tokens={self.num_tokens} from proj.2.weight shape={weight_shape}, norm_size={norm_size}")
-        else:
-            # Fallback based on state_dict or file name
-            if any(k.startswith("double_blocks") for k in state_dict):
-                self.num_tokens = 128
-                is_flux = "flux" in self.ip_ckpt.lower()
-                logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
-            elif "sdxl" in self.ip_ckpt.lower():
-                self.num_tokens = 16
-                logging.info(f"Fallback to SDXL: num_tokens={self.num_tokens}")
-            elif "sd15" in self.ip_ckpt.lower():
-                self.num_tokens = 4
-                logging.info(f"Fallback to SD 1.5: num_tokens={self.num_tokens}")
-            else:
-                logging.warning("Using default num_tokens=4 due to missing proj keys")
 
         logging.info(f"Final num_tokens={self.num_tokens}")
 		
         # Handle XLabs projector
-        if is_flux:
+        if is_xlab:
             xlabs_proj_dict = {}
             for k in all_keys:
                 if "proj" in k.lower() and any(p in k.lower() for p in ["weight", "bias"]):
@@ -265,7 +281,6 @@ class InstantXFluxIPAdapterModelAdvanced:
                 except Exception as e:
                     logging.error(f"Failed to load XLabs parameters: {e}")
                     raise
-
         else:
             # Checking image_proj
             image_proj_dict = None
