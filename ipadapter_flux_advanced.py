@@ -74,15 +74,24 @@ def get_clip_vision_models():
     return unique_models
 
 class MLPProjModelAdvanced(torch.nn.Module):
-    def __init__(self, cross_attention_dim=4096, id_embeddings_dim=1152, num_tokens=4):
+    def __init__(self, cross_attention_dim=4096, id_embeddings_dim=1152, num_tokens=4, single_layer=False):
         super().__init__()
         self.cross_attention_dim = cross_attention_dim
+        self.id_embeddings_dim = id_embeddings_dim
         self.num_tokens = num_tokens
-        self.proj = torch.nn.Sequential(
-            torch.nn.Linear(id_embeddings_dim, id_embeddings_dim * 2),
-            torch.nn.GELU(),
-            torch.nn.Linear(id_embeddings_dim * 2, cross_attention_dim * num_tokens),
-        )
+        logging.debug(f"MLPProjModel init: id_embeddings_dim={id_embeddings_dim}, num_tokens={num_tokens}, single_layer={single_layer}")
+        if single_layer:
+            # One layer projection for XLabs
+            self.proj = torch.nn.Sequential(
+                torch.nn.Linear(id_embeddings_dim, cross_attention_dim * num_tokens),
+            )
+        else:
+            # Two-layer projection for other cases (InstantX)
+            self.proj = torch.nn.Sequential(
+                torch.nn.Linear(id_embeddings_dim, id_embeddings_dim * 2),
+                torch.nn.GELU(),
+                torch.nn.Linear(id_embeddings_dim * 2, cross_attention_dim * num_tokens),
+            )
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
     def forward(self, id_embeds):
@@ -205,7 +214,7 @@ class InstantXFluxIPAdapterModelAdvanced:
         # Find image_proj keys
         image_proj_dict = state_dict.get("image_proj", {})
         if not image_proj_dict:
-            # Try ip_adapter for proj keys (XLabs/InstantX)
+            # Try ip_adapter for proj keys (InstantX)
             image_proj_dict = {k.replace("ip_adapter.", ""): v for k, v in state_dict.items() if k.startswith("ip_adapter.") and "proj" in k.lower()}
             if image_proj_dict:
                 logging.debug(f"Found ip_adapter proj keys: {list(image_proj_dict.keys())[:5]}")
@@ -213,8 +222,7 @@ class InstantXFluxIPAdapterModelAdvanced:
                 logging.warning("No image_proj, InstantX, or proj keys found")
 
         # Detection based on state_dict or file name
-        is_xlab = False
-        if any(k.startswith("double_blocks") for k in state_dict) or is_xlab or "flux" in self.ip_ckpt.lower():
+        if not is_xlab and (any(k.startswith("double_blocks") for k in state_dict) or "flux" in self.ip_ckpt.lower()):
             self.num_tokens = 128
             logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
         elif "sdxl" in self.ip_ckpt.lower():
@@ -235,8 +243,12 @@ class InstantXFluxIPAdapterModelAdvanced:
                 if weight_shape[0] % norm_size == 0:
                     self.num_tokens = weight_shape[0] // norm_size
                     logging.info(f"Detected num_tokens={self.num_tokens} from proj.2.weight shape={weight_shape}, norm_size={norm_size}")
+        elif is_xlab and "ip_adapter_proj_model.proj.weight" in all_keys:  # XLabs single-layer projector
+            weight_shape = state_dict["ip_adapter_proj_model.proj.weight"].shape[0]
+            self.num_tokens = weight_shape // self.joint_attention_dim  # 65536 / 4096 = 16
+            logging.info(f"XLabs: Detected num_tokens={self.num_tokens} from ip_adapter_proj_model.proj.weight shape={weight_shape}, joint_attention_dim={self.joint_attention_dim}")
         else:
-            logging.warning("Using default num_tokens=4 due to bad detection, suspicious...")
+            logging.warning("Auto-detection failed, it looks suspicious, using previous value...")
 
         logging.info(f"Final num_tokens={self.num_tokens}")
 		
@@ -245,31 +257,46 @@ class InstantXFluxIPAdapterModelAdvanced:
             xlabs_proj_dict = {}
             for k in all_keys:
                 if k.startswith("ip_adapter_proj_model."):
-                    # Remove ip_adapter_proj_model prefix to match MLPProjModelAdvanced expected keys
+                    # Keep original key names without renaming
                     new_key = k.replace("ip_adapter_proj_model.", "")
-                    # Map proj.weight/bias to MLPProjModelAdvanced's proj.0.weight/bias (first layer)
-                    if new_key == "proj.weight":
-                        new_key = "proj.0.weight"
-                    elif new_key == "proj.bias":
-                        new_key = "proj.0.bias"
                     xlabs_proj_dict[new_key] = state_dict[k]
+                    
             if xlabs_proj_dict:
-                logging.debug(f"Found XLabs proj keys: {list(xlabs_proj_dict.keys())}")
+                logging.debug(f"Found XLabs proj keys: {list(xlabs_proj_dict.keys())}")  
+             
+                # Use projection_dim for id_embeddings_dim
+                id_embeddings_dim = getattr(self.image_encoder.config, "projection_dim", 768)
+                if "proj.weight" in xlabs_proj_dict:  # Check original key name
+                    expected_dim = xlabs_proj_dict["proj.weight"].shape[1]  # Input size
+                    if id_embeddings_dim != expected_dim:
+                        logging.warning(f"XLabs: Mismatch in hidden_size: expected {expected_dim}, got {id_embeddings_dim} from projection_dim. Will use projection layer in get_image_embeds.")
+                        id_embeddings_dim = expected_dim
+                
                 self.image_proj_model = MLPProjModelAdvanced(
                     cross_attention_dim=self.joint_attention_dim,  # 4096
-                    id_embeddings_dim=self.image_encoder.config.hidden_size,  # 1024 for clip-vit-large-patch14
+                    id_embeddings_dim=id_embeddings_dim,  # 768 for clip-vit-large-patch14
                     num_tokens=self.num_tokens,  # 128
+                    single_layer=True
                 ).to(self.device, dtype=self.dtype)
                 try:
+                    # Rename keys to match single-layer model
+                    adjusted_dict = {}
+                    for k, v in xlabs_proj_dict.items():
+                        if k == "proj.weight":
+                            adjusted_dict["proj.0.weight"] = v  # Map to single-layer weight
+                        elif k == "proj.bias":
+                            adjusted_dict["proj.0.bias"] = v  # Map to single-layer bias
+                        else:
+                            adjusted_dict[k] = v  # norm.weight, norm.bias unchanged
                     # Log expected keys for debugging
                     if DEBUG_ENABLED:
                         expected_keys = list(self.image_proj_model.state_dict().keys())
                         logging.debug(f"Expected keys in MLPProjModelAdvanced: {expected_keys}")
                         # Check for missing keys
-                        missing_keys = set(expected_keys) - set(xlabs_proj_dict.keys())
+                        missing_keys = set(expected_keys) - set(adjusted_dict.keys())
                         if missing_keys:
                             logging.warning(f"Missing keys in xlabs_proj_dict: {missing_keys}")
-                    self.image_proj_model.load_state_dict(xlabs_proj_dict, strict=False)
+                    self.image_proj_model.load_state_dict(adjusted_dict, strict=False)
                     logging.info("Loaded XLabs image_proj successfully")
                 except Exception as e:
                     logging.error(f"Failed to load XLabs image_proj parameters: {e}")
@@ -278,18 +305,21 @@ class InstantXFluxIPAdapterModelAdvanced:
                 logging.warning("No XLabs proj keys found, using raw clip_image_embeds")
                 self.image_proj_model = None
         else:
-            # Handle non-XLabs projector
-            image_proj_dict = None
-            has_image_proj = any(k.startswith("image_proj.") for k in all_keys) or "image_proj" in state_dict
-            if has_image_proj:
-                if "image_proj" in state_dict:
-                    image_proj_dict = state_dict["image_proj"]
-                else:
-                    image_proj_dict = {k.replace("image_proj.", ""): v for k in all_keys if k.startswith("image_proj.")}
-                logging.info(f"Found image_proj keys: {list(image_proj_dict.keys())[:5]}")
+            # Non-XLabs (e.g., InstantX)
+            id_embeddings_dim = getattr(self.image_encoder.config, "hidden_size", 1152)  # 1152 for SigLIP
+            
+            image_proj_dict = state_dict.get("image_proj", {k.replace("image_proj.", ""): v for k in all_keys if k.startswith("image_proj.")})
+            if image_proj_dict:
+                logging.debug(f"Found image_proj keys: {list(image_proj_dict.keys())[:5]}")
+                if "proj.0.weight" in image_proj_dict:
+                    expected_dim = image_proj_dict["proj.0.weight"].shape[1]  # Input size of the first linear layer
+                    if id_embeddings_dim != expected_dim:
+                        logging.warning(f"Non-XLabs: Mismatch in hidden_size: expected {expected_dim}, got {id_embeddings_dim} from hidden_size. Will use projection layer in get_image_embeds.")
+                        id_embeddings_dim = expected_dim
+                
                 self.image_proj_model = MLPProjModelAdvanced(
                     cross_attention_dim=self.joint_attention_dim,
-                    id_embeddings_dim=self.image_encoder.config.hidden_size, #1152
+                    id_embeddings_dim=id_embeddings_dim, #1152
                     num_tokens=self.num_tokens,
                 ).to(self.device, dtype=self.dtype)
                 try:
@@ -379,7 +409,7 @@ class InstantXFluxIPAdapterModelAdvanced:
             # No single blocks in XLabs flux-ip-adapter-v2
             logging.info("Initialized XLabs IP-Adapter with 19 double blocks")
         else:
-			# For non-XLabs models, use default configuration
+            # For non-XLabs models, use default configuration
             dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
             for i in range(dsb_count):
                 name = f"double_blocks.{i}"
@@ -425,26 +455,79 @@ class InstantXFluxIPAdapterModelAdvanced:
         # Generate image embeddings from PIL image or provided embeddings
         if pil_image is not None:
             if isinstance(pil_image, Image.Image):
+                logging.info("pil_image is a single Image, wrapping in list")
                 pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.dtype)).pooler_output
-            clip_image_embeds = clip_image_embeds.to(dtype=self.dtype)
+            try:
+                clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+                logging.debug(f"clip_image shape: {clip_image.shape}")
+            except Exception as e:
+                logging.error(f"Failed to process PIL image: {e}")
+                raise
+            try:
+                clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=self.dtype)).pooler_output
+                clip_image_embeds = clip_image_embeds.to(dtype=self.dtype)
+                logging.debug(f"clip_image_embeds shape: {clip_image_embeds.shape}, dtype: {clip_image_embeds.dtype}")
+            except Exception as e:
+                logging.error(f"Failed to encode image with CLIP: {e}")
+                raise
         else:
+            if clip_image_embeds is None:
+                logging.error("No PIL image or clip_image_embeds provided")
+                raise ValueError("Either pil_image or clip_image_embeds must be provided")
             clip_image_embeds = clip_image_embeds.to(self.device, dtype=self.dtype)
+            logging.debug(f"Provided clip_image_embeds shape: {clip_image_embeds.shape}, dtype: {clip_image_embeds.dtype}")
 
         if self.image_proj_model is None:
-            logging.info("Using raw clip_image_embeds")
+            logging.info("image_proj_model is None, using raw clip_image_embeds")
             target_size = self.joint_attention_dim
             if clip_image_embeds.shape[1] != target_size:
                 if self.fallback_proj is None:
-                    logging.warning(f"Creating fallback projection from {clip_image_embeds.shape[1]} to joint_attention_dim={target_size}")
+                    logging.info(f"Creating fallback projection: Linear({clip_image_embeds.shape[1]}, {target_size})")
                     self.fallback_proj = torch.nn.Linear(clip_image_embeds.shape[1], target_size).to(self.device, dtype=self.dtype)
                     torch.nn.init.xavier_uniform_(self.fallback_proj.weight)
                     self.fallback_proj.bias.data.fill_(0)
                 clip_image_embeds = self.fallback_proj(clip_image_embeds)
+                logging.debug(f"clip_image_embeds after fallback_proj: {clip_image_embeds.shape}")
             clip_image_embeds = clip_image_embeds.unsqueeze(1).repeat(1, self.num_tokens, 1)
+            logging.debug(f"Final clip_image_embeds shape: {clip_image_embeds.shape}")
             return clip_image_embeds
-        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+        
+        # Log image_proj_model parameters
+        if hasattr(self.image_proj_model, 'id_embeddings_dim'):
+            logging.debug(f"image_proj_model: id_embeddings_dim={self.image_proj_model.id_embeddings_dim}, num_tokens={self.image_proj_model.num_tokens}")
+        else:
+            logging.warning("image_proj_model has no id_embeddings_dim attribute")
+
+        # Check if projection is needed
+        if hasattr(self.image_proj_model, 'id_embeddings_dim'):
+            expected_dim = self.image_proj_model.id_embeddings_dim
+            actual_dim = clip_image_embeds.shape[-1]
+            if actual_dim != expected_dim:
+                logging.warning(f"Mismatch in dimensions: expected {expected_dim} for image_proj_model, got {actual_dim} from CLIP Vision. Adding projection layer.")
+                # Always reinitialize embed_projection to ensure correct dimensions
+                logging.info(f"Creating/Reinitializing embed_projection: Linear({actual_dim}, {expected_dim})")
+                self.embed_projection = torch.nn.Linear(actual_dim, expected_dim).to(self.device, dtype=self.dtype)
+                torch.nn.init.xavier_uniform_(self.embed_projection.weight)
+                self.embed_projection.bias.data.fill_(0)
+                logging.debug(f"embed_projection created: weight shape={self.embed_projection.weight.shape}, bias shape={self.embed_projection.bias.shape}")
+                try:
+                    clip_image_embeds = self.embed_projection(clip_image_embeds)
+                    logging.debug(f"clip_image_embeds after embed_projection: {clip_image_embeds.shape}")
+                except Exception as e:
+                    logging.error(f"Failed to apply embed_projection: {e}")
+                    raise
+        else:
+            logging.warning("image_proj_model has no id_embeddings_dim attribute, skipping projection")
+
+        # Apply projection model
+        try:
+            image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+            logging.info(f"image_prompt_embeds shape: {image_prompt_embeds.shape}, dtype={image_prompt_embeds.dtype}")
+            logging.debug(f"image_prompt_embeds sample values (first 5): {image_prompt_embeds.flatten()[:5].tolist()}")
+        except Exception as e:
+            logging.error(f"Failed to apply image_proj_model: {e}")
+            raise
+
         return image_prompt_embeds
 
 class IPAdapterFluxLoaderAdvanced:
