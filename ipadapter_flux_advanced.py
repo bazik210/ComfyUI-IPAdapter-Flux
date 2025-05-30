@@ -7,8 +7,11 @@ from transformers import AutoProcessor, CLIPVisionModel, SiglipVisionModel
 from PIL import Image
 import numpy as np
 from .attention_processor_advanced import IPAFluxAttnProcessor2_0Advanced
-from .utils import is_model_patched, FluxUpdateModules
+from .utils import is_model_patched, FluxUpdateModules, _compute_sha256
 from safetensors.torch import load_file
+from .hashes import KNOWN_XLAB_HASHES
+
+DEBUG_ENABLED = False
 
 # Define model directories
 MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter-flux")
@@ -89,7 +92,7 @@ class MLPProjModelAdvanced(torch.nn.Module):
         return x
 
 class InstantXFluxIPAdapterModelAdvanced:
-    def __init__(self, image_encoder_path, ip_ckpt, device, dtype=torch.bfloat16):
+    def __init__(self, image_encoder_path, ip_ckpt, device, dtype=torch.bfloat16, shuffle_weights=False):
         self.device = device
         self.dtype = dtype
         self.image_encoder_path = image_encoder_path
@@ -138,7 +141,7 @@ class InstantXFluxIPAdapterModelAdvanced:
                                 clip_path = fallback_path
                                 logging.info(f"Using local model: {clip_path} with hf_model: {hf_model}")
                             else:
-                                if "/" in image_encoder_path:
+                                if "/" in image_encoder_path and not os.path.exists(image_encoder_path):
                                     hf_model = image_encoder_path
                                     logging.info(f"Using image_encoder_path as hf_model: {hf_model}")
                                 else:
@@ -183,12 +186,17 @@ class InstantXFluxIPAdapterModelAdvanced:
             state_dict = torch.load(path, map_location="cpu")
             logging.info("Loaded using torch.load")
 
+        sha256_hash = _compute_sha256(path)
+        is_xlab = sha256_hash in KNOWN_XLAB_HASHES
+        self.is_xlab = is_xlab  # Store is_xlab for init_ip_adapter
+        logging.info(f"SHA256: {sha256_hash}, is_xlab: {is_xlab}")
+
         self.joint_attention_dim = 4096
         self.hidden_size = 3072
 
         # Log state_dict keys
         all_keys = list(state_dict.keys())
-        logging.info(f"State dict keys (first 10): {all_keys[:10]}")
+        logging.debug(f"State dict keys (first 10): {all_keys[:10]}")
 
         # Determine num_tokens
         self.num_tokens = 4
@@ -200,12 +208,21 @@ class InstantXFluxIPAdapterModelAdvanced:
             # Try ip_adapter for proj keys (XLabs/InstantX)
             image_proj_dict = {k.replace("ip_adapter.", ""): v for k, v in state_dict.items() if k.startswith("ip_adapter.") and "proj" in k.lower()}
             if image_proj_dict:
-                logging.info(f"Found ip_adapter proj keys: {list(image_proj_dict.keys())[:5]}")
+                logging.debug(f"Found ip_adapter proj keys: {list(image_proj_dict.keys())[:5]}")
             else:
                 logging.warning("No image_proj, InstantX, or proj keys found")
 
-        # Auto-detect num_tokens
-        is_flux = False
+        # Detection based on state_dict or file name
+        is_xlab = False
+        if any(k.startswith("double_blocks") for k in state_dict) or is_xlab or "flux" in self.ip_ckpt.lower():
+            self.num_tokens = 128
+            logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
+        elif "sdxl" in self.ip_ckpt.lower():
+            raise ValueError("SDXL is not supported")
+        elif "sd15" in self.ip_ckpt.lower():
+            raise ValueError("SD 1.5 is not supported")
+
+        # Auto-detect num_tokens as fail-safe
         if "norm.weight" in image_proj_dict and ("proj.weight" in image_proj_dict or "proj.2.weight" in image_proj_dict):
             norm_size = image_proj_dict["norm.weight"].shape[0]
             if "proj.weight" in image_proj_dict:  # Single-layer projector
@@ -219,55 +236,49 @@ class InstantXFluxIPAdapterModelAdvanced:
                     self.num_tokens = weight_shape[0] // norm_size
                     logging.info(f"Detected num_tokens={self.num_tokens} from proj.2.weight shape={weight_shape}, norm_size={norm_size}")
         else:
-            # Fallback based on state_dict or file name
-            if any(k.startswith("double_blocks") for k in state_dict):
-                self.num_tokens = 128
-                is_flux = "flux" in self.ip_ckpt.lower()
-                logging.info(f"Fallback to Flux.1: num_tokens={self.num_tokens}")
-            elif "sdxl" in self.ip_ckpt.lower():
-                self.num_tokens = 16
-                logging.info(f"Fallback to SDXL: num_tokens={self.num_tokens}")
-            elif "sd15" in self.ip_ckpt.lower():
-                self.num_tokens = 4
-                logging.info(f"Fallback to SD 1.5: num_tokens={self.num_tokens}")
-            else:
-                logging.warning("Using default num_tokens=4 due to missing proj keys")
+            logging.warning("Using default num_tokens=4 due to bad detection, suspicious...")
 
         logging.info(f"Final num_tokens={self.num_tokens}")
 		
         # Handle XLabs projector
-        if is_flux:
+        if is_xlab:
             xlabs_proj_dict = {}
             for k in all_keys:
-                if "proj" in k.lower() and any(p in k.lower() for p in ["weight", "bias"]):
-                    if "double_blocks" in k:
-                        new_key = k.replace("double_blocks.0.processor.ip_adapter_double_stream_", "")
-                        xlabs_proj_dict[new_key] = state_dict[k]
-                    else:
-                        xlabs_proj_dict[k] = state_dict[k]
+                if k.startswith("ip_adapter_proj_model."):
+                    # Remove ip_adapter_proj_model prefix to match MLPProjModelAdvanced expected keys
+                    new_key = k.replace("ip_adapter_proj_model.", "")
+                    # Map proj.weight/bias to MLPProjModelAdvanced's proj.0.weight/bias (first layer)
+                    if new_key == "proj.weight":
+                        new_key = "proj.0.weight"
+                    elif new_key == "proj.bias":
+                        new_key = "proj.0.bias"
+                    xlabs_proj_dict[new_key] = state_dict[k]
             if xlabs_proj_dict:
-                logging.info(f"Found XLabs proj keys: {list(xlabs_proj_dict.keys())[:5]}")
-                self.image_proj_model = MLPProjModel(
+                logging.debug(f"Found XLabs proj keys: {list(xlabs_proj_dict.keys())}")
+                self.image_proj_model = MLPProjModelAdvanced(
                     cross_attention_dim=self.joint_attention_dim,  # 4096
                     id_embeddings_dim=self.image_encoder.config.hidden_size,  # 1024 for clip-vit-large-patch14
                     num_tokens=self.num_tokens,  # 128
                 ).to(self.device, dtype=self.dtype)
                 try:
-                    proj = {}
-                    for key, value in state_dict.items():
-                        if key.startswith("ip_adapter_proj_model"):
-                            proj[key[len("ip_adapter_proj_model."):]] = value
-                    if not proj:
-                        logging.error("No ip_adapter_proj_model keys found in state_dict")
-                        raise KeyError("No ip_adapter_proj_model keys found")
-                    self.image_proj_model.load_state_dict(proj, strict=False)
+                    # Log expected keys for debugging
+                    if DEBUG_ENABLED:
+                        expected_keys = list(self.image_proj_model.state_dict().keys())
+                        logging.debug(f"Expected keys in MLPProjModelAdvanced: {expected_keys}")
+                        # Check for missing keys
+                        missing_keys = set(expected_keys) - set(xlabs_proj_dict.keys())
+                        if missing_keys:
+                            logging.warning(f"Missing keys in xlabs_proj_dict: {missing_keys}")
+                    self.image_proj_model.load_state_dict(xlabs_proj_dict, strict=False)
                     logging.info("Loaded XLabs image_proj successfully")
                 except Exception as e:
-                    logging.error(f"Failed to load XLabs parameters: {e}")
-                    raise
-
+                    logging.error(f"Failed to load XLabs image_proj parameters: {e}")
+                    self.image_proj_model = None  # Fallback to raw embeds
+            else:
+                logging.warning("No XLabs proj keys found, using raw clip_image_embeds")
+                self.image_proj_model = None
         else:
-            # Checking image_proj
+            # Handle non-XLabs projector
             image_proj_dict = None
             has_image_proj = any(k.startswith("image_proj.") for k in all_keys) or "image_proj" in state_dict
             if has_image_proj:
@@ -276,7 +287,7 @@ class InstantXFluxIPAdapterModelAdvanced:
                 else:
                     image_proj_dict = {k.replace("image_proj.", ""): v for k in all_keys if k.startswith("image_proj.")}
                 logging.info(f"Found image_proj keys: {list(image_proj_dict.keys())[:5]}")
-                self.image_proj_model = MLPProjModel(
+                self.image_proj_model = MLPProjModelAdvanced(
                     cross_attention_dim=self.joint_attention_dim,
                     id_embeddings_dim=self.image_encoder.config.hidden_size, #1152
                     num_tokens=self.num_tokens,
@@ -298,10 +309,18 @@ class InstantXFluxIPAdapterModelAdvanced:
             logging.info("Using InstantX ip_adapter format")
         else:
             for k in all_keys:
-                if k.startswith("double_blocks.") or k.startswith("single_blocks."):
-                    new_key = k.replace("double_blocks.", "").replace("single_blocks.", "")
-                    new_key = new_key.replace("processor.ip_adapter_double_stream_", "").replace("processor.ip_adapter_single_stream_", "")
-                    ip_adapter_dict[new_key] = state_dict[k]
+                if k.startswith("double_blocks."):
+                    # Remove double_blocks prefix, keep block index
+                    new_key = k.replace("double_blocks.", "")
+                    new_key = new_key.replace("processor.ip_adapter_double_stream_", "")
+                    # Rename k_proj and v_proj weights to match IPAFluxAttnProcessor2_0 expected names
+                    if "k_proj.weight" in new_key:
+                        new_key = new_key.replace("k_proj.weight", "to_k_ip.weight")
+                    elif "v_proj.weight" in new_key:
+                        new_key = new_key.replace("v_proj.weight", "to_v_ip.weight")
+                    # Skip bias keys as IPAFluxAttnProcessor2_0 does not expect them
+                    if "bias" not in new_key:
+                        ip_adapter_dict[new_key] = state_dict[k]
             logging.info("Using XLabs ip_adapter format")
 
         if not ip_adapter_dict:
@@ -310,10 +329,28 @@ class InstantXFluxIPAdapterModelAdvanced:
 
         # Initialize ipadapter
         self.ip_attn_procs = self.init_ip_adapter_advanced()
-        ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
-        logging.info(f"Loading ip_adapter with keys: {list(ip_adapter_dict.keys())[:5]}")
+        if shuffle_weights:
+            if not is_xlab:
+                # For InstantX Flux, use values directly without sorting
+                ip_layers = torch.nn.ModuleList(self.ip_attn_procs.values())
+            else:
+                # Shuffle keys randomly for non-InstantX Flux adapters
+                import random
+                keys = list(self.ip_attn_procs.keys())
+                random.shuffle(keys)
+                ip_layers = torch.nn.ModuleList([self.ip_attn_procs[key] for key in keys])
+            logging.info("Using shuffled weights for IP-Adapter")
+        else:
+            # Use standard sorting for other adapters (Flux.1, InstantX)
+            sorted_keys = sorted(self.ip_attn_procs.keys())
+            ip_layers = torch.nn.ModuleList([self.ip_attn_procs[key] for key in sorted_keys])
+            logging.info("Using sorted weights for IP-Adapter")
         try:
-            ip_layers.load_state_dict(ip_adapter_dict, strict=True)
+            if DEBUG_ENABLED:
+                # Log expected keys for debugging
+                sample_proc = list(self.ip_attn_procs.values())[0]
+                logging.debug(f"Expected parameter names in IPAFluxAttnProcessor2_0: {list(sample_proc.state_dict().keys())}")
+            ip_layers.load_state_dict(ip_adapter_dict, strict=False)
             logging.info("Loaded ip_adapter successfully")
         except Exception as e:
             logging.error(f"Failed to load ip_adapter: {e}")
@@ -325,30 +362,49 @@ class InstantXFluxIPAdapterModelAdvanced:
         # Initialize attention processors for double and single blocks
         weight_start, weight_end, steps = weight_params
         ip_attn_procs = {}
-        dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
-        for i in range(dsb_count):
-            name = f"double_blocks.{i}"
-            ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
-                hidden_size=self.hidden_size,
-                cross_attention_dim=self.joint_attention_dim,
-                num_tokens=self.num_tokens,
-                scale_start=weight_start,
-                scale_end=weight_end,
-                total_steps=steps,
-                timestep_range=timestep_percent_range
-            ).to(self.device, dtype=self.dtype)
-        ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
-        for i in range(ssb_count):
-            name = f"single_blocks.{i}"
-            ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
-                hidden_size=self.hidden_size,
-                cross_attention_dim=self.joint_attention_dim,
-                num_tokens=self.num_tokens,
-                scale_start=weight_start,
-                scale_end=weight_end,
-                total_steps=steps,
-                timestep_range=timestep_percent_range
-            ).to(self.device, dtype=self.dtype)
+        if hasattr(self, 'is_xlab') and self.is_xlab:
+            # For XLabs models (e.g., flux-ip-adapter-v2), use only 19 double blocks
+            dsb_count = 19  # Number of double blocks in flux-ip-adapter-v2
+            for i in range(dsb_count):
+                name = f"double_blocks.{i}"
+                ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
+                    hidden_size=self.hidden_size,
+                    cross_attention_dim=self.joint_attention_dim,
+                    num_tokens=self.num_tokens,
+                    scale_start=weight_start,
+                    scale_end=weight_end,
+                    total_steps=steps,
+                    timestep_range=timestep_percent_range
+                ).to(self.device, dtype=self.dtype)
+            # No single blocks in XLabs flux-ip-adapter-v2
+            logging.info("Initialized XLabs IP-Adapter with 19 double blocks")
+        else:
+			# For non-XLabs models, use default configuration
+            dsb_count = 19 #len(flux_model.diffusion_model.double_blocks)
+            for i in range(dsb_count):
+                name = f"double_blocks.{i}"
+                ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
+                    hidden_size=self.hidden_size,
+                    cross_attention_dim=self.joint_attention_dim,
+                    num_tokens=self.num_tokens,
+                    scale_start=weight_start,
+                    scale_end=weight_end,
+                    total_steps=steps,
+                    timestep_range=timestep_percent_range
+                ).to(self.device, dtype=self.dtype)
+            ssb_count = 38 #len(flux_model.diffusion_model.single_blocks)
+            for i in range(ssb_count):
+                name = f"single_blocks.{i}"
+                ip_attn_procs[name] = IPAFluxAttnProcessor2_0Advanced(
+                    hidden_size=self.hidden_size,
+                    cross_attention_dim=self.joint_attention_dim,
+                    num_tokens=self.num_tokens,
+                    scale_start=weight_start,
+                    scale_end=weight_end,
+                    total_steps=steps,
+                    timestep_range=timestep_percent_range
+                ).to(self.device, dtype=self.dtype)
+            logging.info("Initialized non-XLabs IP-Adapter with 19 double blocks and 38 single blocks")
         return ip_attn_procs
 
     def update_ip_adapter_advanced(self, flux_model, weight_params, timestep_percent_range=(0.0, 1.0)):
@@ -400,6 +456,7 @@ class IPAdapterFluxLoaderAdvanced:
                 "clip_vision": (get_clip_vision_models(),),
                 "provider": (["cuda", "cpu", "mps"],),
                 "dtype": (["auto", "float16", "bfloat16"], {"default": "auto"}),
+                "shuffle_weights": ("BOOLEAN", {"default": False})
             }
         }
 
@@ -408,7 +465,7 @@ class IPAdapterFluxLoaderAdvanced:
     FUNCTION = "load_model_advanced"
     CATEGORY = "InstantXNodes"
 
-    def load_model_advanced(self, ipadapter, clip_vision, provider, dtype="auto"):
+    def load_model_advanced(self, ipadapter, clip_vision, provider, dtype="auto", shuffle_weights="False"):
         # Load the advanced IP-Adapter model
         logging.info(f"Loading InstantX IPAdapter Flux Advanced model: {ipadapter}, clip_vision={clip_vision}, dtype={dtype}")
         if dtype == "auto":
@@ -419,7 +476,8 @@ class IPAdapterFluxLoaderAdvanced:
             image_encoder_path=clip_vision,
             ip_ckpt=ipadapter,
             device=provider,
-            dtype=getattr(torch, dtype)
+            dtype=getattr(torch, dtype),
+            shuffle_weights=shuffle_weights
         )
         return (model,)
 
